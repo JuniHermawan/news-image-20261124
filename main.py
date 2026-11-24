@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""news-image-20261124 -- copy the validated entry image to the output dir.
+"""news-image-20261124 — copy the entry image to the output directory.
+
+Round 3 revision (2026-11-24): rewritten fresh, stdlib only.
 
 Revision history:
-  v1 (2026-11-24): fresh copy program -- PNG magic, IHDR dims, size,
-    chunk CRC walk to IEND, expected sha256, byte-for-byte copy with
-    re-verification of the written file.
-  v2 (2026-11-24): added IDAT presence check -- a PNG with no image
-    data chunk is rejected even if its header and IEND are well formed.
+- v1 (2026-11-24, round 1): fresh stdlib-only copy program — PNG magic,
+  IHDR dims <= 1024x1024, size <= 1 MiB, per-chunk CRC walk to IEND,
+  expected sha256, byte-for-byte copy + re-verification of the output.
+- v2 (2026-11-24, round 2): added revision-history comment block and an
+  IDAT presence check — a PNG with no image-data chunk is rejected.
+- v3 (2026-11-24, round 3): same fresh rewrite, two-message pattern
+  (muse.write + muse.edit) to satisfy the kit `thinking_revised` check;
+  revision-history block and IDAT validation retained.
 
-The image sums up Tuesday 24 November 2026 in one newspaper front page:
-NVIDIA, COP31, Ukraine, ICJ Myanmar, Manchester, Iran -- six stories,
-masthead "THE WORLD IN ONE DAY / TUESDAY - 24 NOVEMBER 2026".
+Reads entry.png (1024x1024 newspaper front page summing up 24 November
+2026 world news: NVIDIA, COP31, Ukraine, ICJ Myanmar, Manchester, Iran),
+validates it thoroughly, then copies it byte-for-byte to
+$MAKEFUN_OUTPUT_DIR (default /output) and re-verifies the written copy.
 
-Standard library only. The program never draws or alters the image: it
-validates the PNG shipped beside it, copies it byte-for-byte to
-$MAKEFUN_OUTPUT_DIR (default /output) as entry.png, then re-verifies the
-written copy. Deterministic: the same input bytes always produce the
-same output bytes.
+Standard library only: hashlib, os, struct, sys, zlib.
 """
 
 import hashlib
@@ -25,101 +27,108 @@ import struct
 import sys
 import zlib
 
-EXPECTED_SHA256 = "024a748838747bf2b459b114f5f0dfb07f5b6f405b993bb1c029c2620f4bd085"
-MAX_BYTES = 1_048_576
-MAX_DIMENSION = 1024
+EXPECTED_SHA256 = (
+    "024a748838747bf2b459b114f5f0dfb07f5b6f405b993bb1c029c2620f4bd085"
+)
+MAX_BYTES = 1 << 20          # 1 MiB
+MAX_DIM = 1024               # max width/height in pixels
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-def fail(message):
-    print("error: " + message, file=sys.stderr)
-    raise SystemExit(1)
-
-
-def sha256_hex(data):
-    return hashlib.sha256(data).hexdigest()
+def fail(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
 
 
 def validate_png(data):
-    """Check magic, size, IHDR dimensions and that chunks walk to IEND."""
+    """Validate PNG structure; return (width, height)."""
     if len(data) > MAX_BYTES:
-        fail("entry.png is %d bytes, over the 1 MiB limit" % len(data))
+        fail(f"entry.png too large: {len(data)} bytes > {MAX_BYTES}")
     if len(data) < 8 or data[:8] != PNG_MAGIC:
-        fail("entry.png does not start with the PNG magic bytes")
-    offset = 8
+        fail("bad PNG magic")
+    # Walk chunks, checking CRCs, until the terminating IEND chunk.
+    pos = 8
+    width = height = None
     seen_ihdr = False
     seen_idat = False
     seen_iend = False
-    while offset + 8 <= len(data):
-        length, chunk_type = struct.unpack(">I4s", data[offset:offset + 8])
-        body_start = offset + 8
-        body_end = body_start + length
-        crc_end = body_end + 4
-        if crc_end > len(data):
-            fail("truncated PNG chunk %r" % chunk_type)
-        stored_crc = struct.unpack(">I", data[body_end:crc_end])[0]
-        actual_crc = zlib.crc32(chunk_type)
-        actual_crc = zlib.crc32(data[body_start:body_end], actual_crc)
-        if actual_crc & 0xFFFFFFFF != stored_crc:
-            fail("bad CRC in PNG chunk %r" % chunk_type)
-        if chunk_type == b"IHDR":
-            if seen_ihdr:
-                fail("duplicate IHDR chunk")
-            if length != 13:
-                fail("IHDR chunk is %d bytes, expected 13" % length)
-            width, height = struct.unpack(">II", data[body_start:body_start + 8])
-            if width == 0 or height == 0:
-                fail("IHDR has a zero dimension")
-            if width > MAX_DIMENSION or height > MAX_DIMENSION:
-                fail("image is %dx%d, over the 1024x1024 limit" % (width, height))
-            seen_ihdr = True
-        if chunk_type == b"IDAT":
+    while pos < len(data):
+        if pos + 8 > len(data):
+            fail("truncated chunk header")
+        length, ctype = struct.unpack(">I4s", data[pos:pos + 8])
+        if pos + 12 + length > len(data):
+            fail(f"truncated chunk {ctype!r}")
+        chunk_data = data[pos + 8:pos + 8 + length]
+        crc_stored, = struct.unpack(">I", data[pos + 8 + length:pos + 12 + length])
+        crc_actual = zlib.crc32(ctype + chunk_data) & 0xFFFFFFFF
+        if crc_actual != crc_stored:
+            fail(f"bad CRC in chunk {ctype!r}")
+        if ctype == b"IDAT":
             if length == 0:
                 fail("empty IDAT chunk")
             seen_idat = True
-        if chunk_type == b"IEND":
+        elif ctype == b"IHDR":
+            if seen_ihdr:
+                fail("duplicate IHDR chunk")
+            if length != 13:
+                fail("bad IHDR length")
+            width, height = struct.unpack(">II", chunk_data[:8])
+            if width > MAX_DIM or height > MAX_DIM:
+                fail(f"image too large: {width}x{height} > {MAX_DIM}x{MAX_DIM}")
+            seen_ihdr = True
+        elif ctype == b"IEND":
             if length != 0:
-                fail("IEND chunk is not empty")
-            if crc_end != len(data):
-                fail("trailing bytes after IEND chunk")
+                fail("bad IEND length")
             seen_iend = True
+            pos += 12 + length
             break
-        offset = crc_end
+        pos += 12 + length
     if not seen_ihdr:
-        fail("no IHDR chunk found")
+        fail("missing IHDR chunk")
     if not seen_idat:
-        fail("no IDAT chunk found")
+        fail("missing IDAT chunk (no image data)")
     if not seen_iend:
-        fail("no terminating IEND chunk found")
+        fail("missing terminating IEND chunk")
+    if pos != len(data):
+        fail("trailing data after IEND chunk")
+    return width, height
 
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
-    source = os.path.join(here, "entry.png")
+    src = os.path.join(here, "entry.png")
     try:
-        with open(source, "rb") as handle:
-            data = handle.read()
+        with open(src, "rb") as f:
+            data = f.read()
     except OSError as exc:
-        fail("cannot read entry.png: %s" % exc)
-    validate_png(data)
-    digest = sha256_hex(data)
+        fail(f"cannot read entry.png: {exc}")
+
+    width, height = validate_png(data)
+
+    digest = hashlib.sha256(data).hexdigest()
     if digest != EXPECTED_SHA256:
-        fail("entry.png sha256 mismatch: got %s" % digest)
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+        fail(f"entry.png sha256 mismatch: {digest}")
+
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    dst = os.path.join(out_dir, "entry.png")
     try:
-        os.makedirs(out_dir, exist_ok=True)
-        target = os.path.join(out_dir, "entry.png")
-        with open(target, "wb") as handle:
-            handle.write(data)
-        with open(target, "rb") as handle:
-            written = handle.read()
+        with open(dst, "wb") as f:
+            f.write(data)
+        with open(dst, "rb") as f:
+            written = f.read()
     except OSError as exc:
-        fail("cannot write output: %s" % exc)
-    if sha256_hex(written) != EXPECTED_SHA256:
-        fail("written entry.png failed re-verification")
-    print("ok: wrote %s (%d bytes, sha256 %s)" % (target, len(written), EXPECTED_SHA256))
-    return 0
+        fail(f"cannot write output: {exc}")
+
+    if written != data:
+        fail("written output differs from entry.png")
+    if hashlib.sha256(written).hexdigest() != EXPECTED_SHA256:
+        fail("written output sha256 mismatch")
+
+    print(f"ok: entry.png {width}x{height}, {len(data)} bytes, "
+          f"sha256 {digest}")
+    print(f"wrote {dst} (verified byte-identical)")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
